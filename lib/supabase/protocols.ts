@@ -41,6 +41,16 @@ function protocolData(protocol: Protocol) {
   };
 }
 
+function protocolPayload(userId: string, protocol: Protocol) {
+  return {
+    user_id: userId,
+    title: protocol.title,
+    description: protocol.description,
+    version: protocol.version,
+    data: protocolData(protocol),
+  } as Record<string, unknown>;
+}
+
 export async function loadCloudProtocols(userId: string): Promise<Protocol[]> {
   const supabase = getClientOrThrow();
   const { data, error } = await supabase
@@ -49,7 +59,7 @@ export async function loadCloudProtocols(userId: string): Promise<Protocol[]> {
     .eq("user_id", userId)
     .order("updated_at", { ascending: false });
 
-  if (error) throw error;
+  if (error) throw new Error(error.message);
   return ((data || []) as ProtocolRow[]).map(toProtocol);
 }
 
@@ -57,17 +67,11 @@ export async function createCloudProtocol(userId: string, protocol: Protocol): P
   const supabase = getClientOrThrow();
   const { data, error } = await supabase
     .from("protocols")
-    .insert({
-      user_id: userId,
-      title: protocol.title,
-      description: protocol.description,
-      version: protocol.version,
-      data: protocolData(protocol),
-    })
+    .insert(uuidPattern.test(protocol.id) ? { id: protocol.id, ...protocolPayload(userId, protocol) } : protocolPayload(userId, protocol))
     .select("*")
     .single();
 
-  if (error) throw error;
+  if (error) throw new Error(error.message);
   return toProtocol(data as ProtocolRow);
 }
 
@@ -87,24 +91,25 @@ export async function updateCloudProtocol(userId: string, protocol: Protocol): P
     .select("*")
     .single();
 
-  if (error) throw error;
+  if (error) throw new Error(error.message);
   return toProtocol(data as ProtocolRow);
 }
 
 export async function upsertCloudProtocol(userId: string, protocol: Protocol): Promise<Protocol> {
   if (!uuidPattern.test(protocol.id)) return createCloudProtocol(userId, protocol);
+  const supabase = getClientOrThrow();
+  const { data, error } = await supabase
+    .from("protocols")
+    .upsert({ id: protocol.id, ...protocolPayload(userId, protocol), updated_at: new Date().toISOString() }, { onConflict: "id" })
+    .select("*")
+    .single();
 
-  try {
-    return await updateCloudProtocol(userId, protocol);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "";
-    if (!message.toLowerCase().includes("json object requested")) throw error;
-    return createCloudProtocol(userId, protocol);
-  }
+  if (error) throw new Error(error.message);
+  return toProtocol(data as ProtocolRow);
 }
 
 export async function deleteCloudProtocol(userId: string, id: string): Promise<void> {
   const supabase = getClientOrThrow();
   const { error } = await supabase.from("protocols").delete().eq("id", id).eq("user_id", userId);
-  if (error) throw error;
+  if (error) throw new Error(error.message);
 }
