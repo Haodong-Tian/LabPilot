@@ -1,30 +1,57 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Plus, Play, Timer } from "lucide-react";
-import { createRun, getActiveRuns, upsertRun } from "@/lib/storage";
+import { useAuth } from "@/components/auth-provider";
+import { createExperiment, loadActiveExperiments } from "@/lib/supabase/experiments";
 import { ExperimentRun } from "@/lib/types";
 import { formatDateTime } from "@/lib/utils";
 import { useProtocols } from "@/lib/use-protocols";
 
 export default function ActiveExperiments() {
+  const { user, loading: authLoading } = useAuth();
   const { protocols, loading: protocolsLoading, usingCloud } = useProtocols();
   const [runs, setRuns] = useState<ExperimentRun[]>([]);
   const [selected, setSelected] = useState("");
+  const [loadingRuns, setLoadingRuns] = useState(false);
+  const [error, setError] = useState("");
 
-  const load = () => setRuns(getActiveRuns());
+  const load = useCallback(async () => {
+    if (!user) {
+      setRuns([]);
+      return;
+    }
+    setLoadingRuns(true);
+    setError("");
+    try {
+      setRuns(await loadActiveExperiments(user.id));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not load experiments.");
+    } finally {
+      setLoadingRuns(false);
+    }
+  }, [user]);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load]);
 
-  function start() {
+  async function start() {
+    if (!user) return setError("Login before running an experiment.");
     const protocol = protocols.find((item) => item.id === selected);
     if (!protocol) return;
-    const run = createRun(protocol);
-    upsertRun(run);
-    location.href = `/run/${run.id}`;
+    setError("");
+    try {
+      const run = await createExperiment(user.id, protocol);
+      location.href = `/run/${run.id}`;
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not start experiment.");
+    }
+  }
+
+  if (!authLoading && !user) {
+    return <div className="card p-8 text-center"><Timer className="mx-auto text-slate-400" /><p className="mt-3 font-semibold">Login to run experiments.</p><p className="mt-1 text-sm text-slate-500">Experiment history now syncs to Supabase for your authenticated account.</p></div>;
   }
 
   return (
@@ -33,24 +60,27 @@ export default function ActiveExperiments() {
         <div>
           <p className="label">Active experiments</p>
           <h1 className="mt-1 text-3xl font-bold">Run experiments in parallel.</h1>
-          <p className="mt-2 text-xs font-semibold text-slate-500">Protocol source: {usingCloud ? "Supabase cloud" : "browser localStorage"}. Experiment runs remain local in this phase.</p>
+          <p className="mt-2 text-xs font-semibold text-slate-500">Protocol source: {usingCloud ? "Supabase cloud" : "browser localStorage"}. Experiment runs sync to Supabase.</p>
         </div>
         <div className="flex gap-2">
-          <select className="field mt-0 min-w-48" value={selected} onChange={(event) => setSelected(event.target.value)} disabled={protocolsLoading}>
+          <select className="field mt-0 min-w-48" value={selected} onChange={(event) => setSelected(event.target.value)} disabled={protocolsLoading || !user}>
             <option value="">{protocolsLoading ? "Loading protocols..." : "Choose protocol..."}</option>
             {protocols.map((protocol) => <option key={protocol.id} value={protocol.id}>{protocol.title}</option>)}
           </select>
-          <button className="btn-primary" disabled={!selected} onClick={start}><Plus size={17} /> Start run</button>
+          <button className="btn-primary" disabled={!selected || !user} onClick={start}><Plus size={17} /> Start run</button>
         </div>
       </div>
 
-      {!runs.length ? (
+      {error && <p className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+      {loadingRuns && <div className="card p-8 text-center text-sm text-slate-500">Loading experiments...</div>}
+
+      {!loadingRuns && !runs.length ? (
         <div className="card py-14 text-center">
           <Timer className="mx-auto text-slate-400" />
           <p className="mt-3 font-semibold">No active experiments.</p>
           <p className="mt-1 text-sm text-slate-500">Start a run above; you can keep several active at once.</p>
         </div>
-      ) : (
+      ) : !loadingRuns && (
         <div className="grid gap-4 md:grid-cols-2">
           {runs.map((run) => {
             const step = run.protocolSteps[run.currentStepIndex || 0];

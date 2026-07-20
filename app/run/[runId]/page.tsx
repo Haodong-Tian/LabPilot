@@ -5,7 +5,9 @@ import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Check, Pause, Play, RotateCcw, SkipForward, Square } from "lucide-react";
 import { ExperimentChat } from "@/components/experiment-chat";
-import { getReports, getRuns, upsertReport, upsertRun } from "@/lib/storage";
+import { useAuth } from "@/components/auth-provider";
+import { createExperimentReport, findReportByExperiment } from "@/lib/supabase/experiment-reports";
+import { loadExperiment, updateExperiment } from "@/lib/supabase/experiments";
 import { reportFromRun } from "@/lib/report";
 import { ExperimentRun, StepRunLog } from "@/lib/types";
 import { formatDuration } from "@/lib/utils";
@@ -18,46 +20,79 @@ const elapsed = (log: StepRunLog, clock: number) => {
 
 export default function Runner({ params }: { params: Promise<{ runId: string }> }) {
   const router = useRouter();
+  const { user, loading: authLoading } = useAuth();
+  const [runId, setRunId] = useState("");
   const [run, setRun] = useState<ExperimentRun | null>(null);
   const [clock, setClock] = useState(0);
-  const [mounted, setMounted] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   useEffect(() => {
-    setMounted(true);
-    setClock(Date.now());
-    params.then(({ runId }) => setRun(getRuns().find((item) => item.id === runId) || null));
+    params.then(({ runId }) => setRunId(runId));
   }, [params]);
 
   useEffect(() => {
+    setClock(Date.now());
     const id = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
 
-  if (!mounted) return <div className="card p-8 text-sm text-slate-500">Loading experiment...</div>;
+  useEffect(() => {
+    if (authLoading || !runId) return;
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    setError("");
+    loadExperiment(user.id, runId)
+      .then(setRun)
+      .catch((cause) => setError(cause instanceof Error ? cause.message : "Could not load experiment."))
+      .finally(() => setLoading(false));
+  }, [authLoading, runId, user]);
+
+  if (authLoading || loading) return <div className="card p-8 text-sm text-slate-500">Loading experiment...</div>;
+  if (!user) return <div className="card p-8">Login to open this experiment. <Link className="text-moss underline" href="/run">Back to active experiments</Link></div>;
+  if (error) return <div className="card p-8 text-red-700">{error}</div>;
   if (!run) return <div className="card p-8">Run not found. <Link className="text-moss underline" href="/run">Back to active experiments</Link></div>;
 
-  const index = run.currentStepIndex || 0;
-  const step = run.protocolSteps[index];
-  const log = run.stepLogs[index];
+  const currentUser = user;
+  const currentRun = run;
+  const index = currentRun.currentStepIndex || 0;
+  const step = currentRun.protocolSteps[index];
+  const log = currentRun.stepLogs[index];
   if (!step || !log) return <div className="card p-8">This run has no current step. <Link className="text-moss underline" href="/run">Back to active experiments</Link></div>;
 
   const seconds = elapsed(log, clock);
   const planned = log.plannedDurationSeconds || 0;
-  const isLastStep = index === run.stepLogs.length - 1;
-  const persist = (next: ExperimentRun) => { setRun(next); upsertRun(next); };
-  const updateLog = (patch: Partial<StepRunLog>) => persist({ ...run, updatedAt: new Date().toISOString(), stepLogs: run.stepLogs.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) });
+  const isLastStep = index === currentRun.stepLogs.length - 1;
 
-  const startTimer = () => {
+  async function persist(next: ExperimentRun) {
+    setRun(next);
+    setError("");
+    try {
+      const saved = await updateExperiment(currentUser.id, next);
+      setRun(saved);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not save experiment.");
+    }
+  }
+
+  function updateLog(patch: Partial<StepRunLog>) {
+    void persist({ ...currentRun, updatedAt: new Date().toISOString(), stepLogs: currentRun.stepLogs.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) });
+  }
+
+  function startTimer() {
     const time = new Date().toISOString();
-    persist({ ...run, status: "running", updatedAt: time, stepLogs: run.stepLogs.map((item, itemIndex) => itemIndex === index ? { ...item, status: "in_progress", startedAt: item.startedAt || time, timerStartedAt: time } : item) });
-  };
+    void persist({ ...currentRun, status: "running", updatedAt: time, stepLogs: currentRun.stepLogs.map((item, itemIndex) => itemIndex === index ? { ...item, status: "in_progress", startedAt: item.startedAt || time, timerStartedAt: time } : item) });
+  }
 
-  const pauseTimer = () => {
+  function pauseTimer() {
     const time = new Date().toISOString();
-    persist({ ...run, status: "paused", updatedAt: time, stepLogs: run.stepLogs.map((item, itemIndex) => itemIndex === index ? { ...item, status: "paused", timerSecondsElapsed: elapsed(item, Date.now()), timerStartedAt: undefined, timerPausedAt: time } : item) });
-  };
+    void persist({ ...currentRun, status: "paused", updatedAt: time, stepLogs: currentRun.stepLogs.map((item, itemIndex) => itemIndex === index ? { ...item, status: "paused", timerSecondsElapsed: elapsed(item, Date.now()), timerStartedAt: undefined, timerPausedAt: time } : item) });
+  }
 
-  const finishStep = (skip = false) => {
+  async function finishStep(skip = false) {
     const time = new Date().toISOString();
     const completedLog: StepRunLog = {
       ...log,
@@ -70,30 +105,31 @@ export default function Runner({ params }: { params: Promise<{ runId: string }> 
       actualDurationSeconds: log.startedAt ? Math.round((Date.now() - new Date(log.startedAt).getTime()) / 1000) : 0,
     };
     const next: ExperimentRun = {
-      ...run,
-      stepLogs: run.stepLogs.map((item, itemIndex) => itemIndex === index ? completedLog : item),
+      ...currentRun,
+      stepLogs: currentRun.stepLogs.map((item, itemIndex) => itemIndex === index ? completedLog : item),
       currentStepIndex: isLastStep ? index : index + 1,
       status: isLastStep ? "completed" : "running",
       endedAt: isLastStep ? time : undefined,
       updatedAt: time,
     };
-    persist(next);
+    await persist(next);
     if (isLastStep) {
-      let report = getReports().find((item) => item.experimentRunId === run.id);
-      if (!report) { report = reportFromRun(next); upsertReport(report); }
+      const existing = await findReportByExperiment(currentUser.id, next.id);
+      const report = existing || await createExperimentReport(currentUser.id, reportFromRun(next));
       router.push(`/logs?report=${report.id}`);
     }
-  };
+  }
 
-  const abort = () => {
-    if (confirm("Abort this experiment run?")) persist({ ...run, status: "aborted", endedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
-  };
+  function abort() {
+    if (confirm("Abort this experiment run?")) void persist({ ...currentRun, status: "aborted", endedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+  }
 
   return <div className="mx-auto max-w-4xl">
     <div className="mb-5 flex items-center justify-between"><Link className="btn-secondary" href="/run">Active experiments</Link><button className="btn-danger" onClick={abort}><Square size={16} /> Abort run</button></div>
+    {error && <p className="mb-4 rounded-lg bg-red-50 p-3 text-sm text-red-700">{error}</p>}
     <div className="card overflow-hidden">
       <div className="p-6">
-        <p className="label">{run.protocolName} - Step {index + 1}/{run.protocolSteps.length}</p>
+        <p className="label">{currentRun.protocolName} - Step {index + 1}/{currentRun.protocolSteps.length}</p>
         <h1 className="mt-1 text-2xl font-bold">{step.title}</h1>
         <p className="mt-4 text-lg text-slate-700">{step.instruction}</p>
         {step.materials.length > 0 && <p className="mt-4 text-sm text-slate-600"><b>Materials: </b>{step.materials.join(", ")}</p>}
@@ -113,6 +149,6 @@ export default function Runner({ params }: { params: Promise<{ runId: string }> 
         <div className="flex gap-3"><button className="btn-primary flex-1" onClick={() => finishStep()}><Check size={18} /> {isLastStep ? "Finish Experiment" : "Continue"}</button><button className="btn-secondary" onClick={() => finishStep(true)}><SkipForward size={18} /> Skip</button></div>
       </div>
     </div>
-    <ExperimentChat run={run} currentStep={step} currentStepIndex={index} currentTimerSeconds={seconds} />
+    <ExperimentChat run={currentRun} currentStep={step} currentStepIndex={index} currentTimerSeconds={seconds} />
   </div>;
 }
