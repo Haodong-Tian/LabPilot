@@ -9,7 +9,6 @@ type AuthContextValue = {
   loading: boolean;
   error: string;
   configured: boolean;
-  signInWithEmail: (email: string) => Promise<void>;
   signOut: () => Promise<void>;
 };
 
@@ -29,10 +28,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     let active = true;
-    supabase.auth.getSession().then(({ data, error: sessionError }) => {
+    supabase.auth.getUser().then(({ data, error: userError }) => {
       if (!active) return;
-      if (sessionError) setError(sessionError.message);
-      setUser(data.session?.user || null);
+      if (userError) setError(userError.message);
+      setUser(data.user || null);
       setLoading(false);
     });
 
@@ -52,19 +51,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loading,
     error,
     configured,
-    async signInWithEmail(email: string) {
-      const supabase = getSupabaseBrowserClient();
-      if (!supabase) throw new Error("Supabase is not configured.");
-      setError("");
-      const { error: signInError } = await supabase.auth.signInWithOtp({
-        email,
-        options: { emailRedirectTo: window.location.origin },
-      });
-      if (signInError) {
-        setError(signInError.message);
-        throw signInError;
-      }
-    },
     async signOut() {
       const supabase = getSupabaseBrowserClient();
       if (!supabase) return;
@@ -75,6 +61,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         throw signOutError;
       }
       setUser(null);
+      window.location.href = "/login";
     },
   }), [configured, error, loading, user]);
 
